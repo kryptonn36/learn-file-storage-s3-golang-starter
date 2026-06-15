@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -13,7 +18,7 @@ import (
 )
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 30)
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
 	videoIDStr := r.PathValue("videoID")
 	videoID, err := uuid.Parse(videoIDStr)
 	if err != nil {
@@ -80,12 +85,26 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	initial_url := randomBase64string()
-	url := initial_url + ".mp4"
+	key := initial_url + ".mp4"
+
+	aspectRatio, err := getVideoAspectRatio(f.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error in getting aspect ratio", err)
+		return
+	}
+
+	if aspectRatio == "16:9"{
+		key = "landscape/" + key
+	}else if aspectRatio == "9:16"{
+		key = "portrait/" + key
+	}else {
+		key = "other/" + key
+	}
 
 	bucket_name := "tubely-545556"
 	params := &s3.PutObjectInput{
 		Bucket: &bucket_name,
-		Key: &url,
+		Key: &key,
 		Body: f,
 		ContentType: &mediaType,
 	}
@@ -96,7 +115,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	region := os.Getenv("S3_REGION")
-	videoURL := "https://" + bucket_name + ".s3." + region + ".amazonaws.com/" + url
+	videoURL := "https://" + bucket_name + ".s3." + region + ".amazonaws.com/" + key
 
 	video.VideoURL = &videoURL
 	err = cfg.db.UpdateVideo(video)
@@ -104,5 +123,51 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "error in updating video url", err)
 		return
 	}
+	log.Println("Video Uploaded Successfully")
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+
+func getVideoAspectRatio(filePath string) (string, error){
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+	// buf := bytes.Buffer{}
+	// buf.Write([]byte())
+	aspectRatio := aspectRatio{}
+	err = json.Unmarshal(out.Bytes(), &aspectRatio)
+	if err != nil {
+		return "", err
+	}
+
+	for _, stream := range aspectRatio.Streams{
+		if stream.CodecType == "video"{
+			// result := stream.AspectRatio
+			ratio := float64(stream.Width) / float64(stream.Height)
+			if ratio > 1.7 && ratio < 1.8{
+				return "16:9", nil
+			}
+			if ratio > 0.5 && ratio < 0.6{
+				return "9:16", nil
+			}
+			return "other", nil
+		}
+	} 
+	return "", fmt.Errorf("No video found")
+}
+
+type aspectRatio struct {
+	Streams 		[]Stream 	`json:"streams"`
+}
+
+type Stream struct{
+	Width 		int  		`json:"width"`
+	Height 		int 		`json:"height"`
+	CodecType	string 		`json:"codec_type"`
+	AspectRatio string 		`json:"display_aspect_ratio"`
 }
