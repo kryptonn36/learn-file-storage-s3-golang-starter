@@ -17,6 +17,17 @@ import (
 	"github.com/google/uuid"
 )
 
+type aspectRatio struct {
+	Streams 		[]Stream 	`json:"streams"`
+}
+
+type Stream struct{
+	Width 		int  		`json:"width"`
+	Height 		int 		`json:"height"`
+	CodecType	string 		`json:"codec_type"`
+	AspectRatio string 		`json:"display_aspect_ratio"`
+}
+
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
 	videoIDStr := r.PathValue("videoID")
@@ -71,6 +82,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "error in creating temperory file", err)
 		return
 	}
+
 	defer os.Remove(f.Name())
 	defer f.Close()
 	_, err = io.Copy(f, multi_partFile)
@@ -84,14 +96,28 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	initial_url := randomBase64string()
-	key := initial_url + ".mp4"
-
 	aspectRatio, err := getVideoAspectRatio(f.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error in getting aspect ratio", err)
 		return
 	}
+
+	processed_path, err := processVideoForFastStart(f.Name())
+	if err != nil{
+		respondWithError(w, http.StatusInternalServerError, "error in getting processed file path", err)
+		return
+	}
+	defer os.Remove(processed_path)
+
+	processed_file, err := os.Open(processed_path)
+	if err != nil{
+		respondWithError(w, http.StatusInternalServerError, "error in opening processed file", err)
+		return
+	}
+	defer processed_file.Close()
+
+	initial_url := randomBase64string()
+	key := initial_url + ".mp4"
 
 	if aspectRatio == "16:9"{
 		key = "landscape/" + key
@@ -105,7 +131,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	params := &s3.PutObjectInput{
 		Bucket: &bucket_name,
 		Key: &key,
-		Body: f,
+		Body: processed_file,
 		ContentType: &mediaType,
 	}
 	_, err = cfg.s3Client.PutObject(context.Background(), params)
@@ -120,6 +146,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	video.VideoURL = &videoURL
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
+		log.Println("Error: %v",err)
 		respondWithError(w, http.StatusInternalServerError, "error in updating video url", err)
 		return
 	}
@@ -161,13 +188,19 @@ func getVideoAspectRatio(filePath string) (string, error){
 	return "", fmt.Errorf("No video found")
 }
 
-type aspectRatio struct {
-	Streams 		[]Stream 	`json:"streams"`
-}
+func processVideoForFastStart(filePath string) (string, error){
+	out_filepath := filePath + ".processing"
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", out_filepath)
 
-type Stream struct{
-	Width 		int  		`json:"width"`
-	Height 		int 		`json:"height"`
-	CodecType	string 		`json:"codec_type"`
-	AspectRatio string 		`json:"display_aspect_ratio"`
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil{
+		return "", fmt.Errorf("ffmpeg failed: %v: %s", err, stderr.String())
+	}
+	return out_filepath, nil
 }
